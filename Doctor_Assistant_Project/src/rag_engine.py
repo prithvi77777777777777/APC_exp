@@ -1,0 +1,148 @@
+"""RAG engine: retrieve from Chroma -> prompt -> Ollama -> citation + disclaimer."""
+from __future__ import annotations
+from typing import Any
+import ollama
+
+from src.config import (
+    OLLAMA_MODEL, OLLAMA_HOST, LLM_TEMPERATURE, LLM_NUM_CTX,
+    TOP_K, DISCLAIMER,
+)
+from src.embed_store import get_collection
+
+
+SYSTEM_PROMPT = (
+    "You are a medical reference assistant for qualified doctors. "
+    "Answer STRICTLY using the provided textbook excerpts. "
+    "If the excerpts do not contain the answer, say: "
+    "'The provided textbook excerpts do not cover this.' "
+    "Do not invent facts, do not use outside knowledge, do not give "
+    "patient-specific advice. Be concise, use clinical terminology, "
+    "and structure the answer with short bullet points where helpful."
+)
+
+
+def _format_context(hits: list[dict[str, Any]]) -> str:
+    lines = []
+    for i, h in enumerate(hits, start=1):
+        lines.append(
+            f"[Excerpt {i}] Source: {h['source']} (page {h['page']})\n{h['text']}"
+        )
+    return "\n\n".join(lines)
+
+
+def _build_prompt(question: str, hits: list[dict[str, Any]]) -> str:
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"=== TEXTBOOK EXCERPTS ===\n{_format_context(hits)}\n\n"
+        f"=== DOCTOR'S QUESTION ===\n{question}\n\n"
+        f"=== ANSWER (grounded in excerpts above) ==="
+    )
+
+
+def _dedupe_sources(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen, out = set(), []
+    for h in hits:
+        key = (h["source"], h["page"])
+        if key not in seen:
+            seen.add(key)
+            out.append({"source": h["source"], "page": h["page"]})
+    return out
+
+
+def retrieve(question: str, top_k: int = TOP_K) -> list[dict[str, Any]]:
+    col = get_collection()
+    if col.count() == 0:
+        return []
+    res = col.query(query_texts=[question], n_results=top_k)
+    docs = res.get("documents", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
+    hits = []
+    for doc, meta in zip(docs, metas):
+        hits.append({
+            "text": doc,
+            "source": meta.get("source", "unknown"),
+            "page": meta.get("page", 0),
+        })
+    return hits
+
+
+def answer(question: str, top_k: int = TOP_K) -> dict[str, Any]:
+    hits = retrieve(question, top_k=top_k)
+    if not hits:
+        return {
+            "answer": "No relevant excerpts found in the indexed textbooks.",
+            "sources": [],
+            "disclaimer": DISCLAIMER,
+        }
+
+    prompt = _build_prompt(question, hits)
+    try:
+        client = ollama.Client(host=OLLAMA_HOST)
+        resp = client.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": LLM_TEMPERATURE, "num_ctx": LLM_NUM_CTX},
+        )
+        answer_text = resp["message"]["content"].strip()
+    except Exception as e:
+        return {
+            "answer": f"Ollama error: {e}. Is the server running? Try: ollama serve",
+            "sources": _dedupe_sources(hits),
+            "disclaimer": DISCLAIMER,
+        }
+
+    return {
+        "answer": answer_text,
+        "sources": _dedupe_sources(hits),
+        "disclaimer": DISCLAIMER,
+    }
+
+
+if __name__ == "__main__":
+    import sys
+    q = " ".join(sys.argv[1:]) or "What is the first-line treatment for hypertension?"
+    print(f"[Q] {q}\n")
+    out = answer(q)
+    print("[A]\n" + out["answer"] + "\n")
+    print("[SOURCES]")
+    for s in out["sources"]:
+        print(f"  - {s['source']} (page {s['page']})")
+    print("\n" + out["disclaimer"])
+
+
+# ---------------- Streaming API (for Streamlit) ----------------
+class AnswerStreamer:
+    """Wraps Ollama streaming. Call .stream() for tokens; after exhaustion,
+    .sources and .disclaimer hold the citations and disclaimer."""
+
+    def __init__(self, question: str, top_k: int = TOP_K):
+        self.question = question
+        self.top_k = top_k
+        self.sources: list[dict] = []
+        self.disclaimer: str = DISCLAIMER
+        self.error = None
+        self._hits = retrieve(question, top_k=top_k)
+
+    def stream(self):
+        if not self._hits:
+            self.sources = []
+            yield "No relevant excerpts found in the indexed textbooks."
+            return
+
+        self.sources = _dedupe_sources(self._hits)
+        prompt = _build_prompt(self.question, self._hits)
+
+        try:
+            client = ollama.Client(host=OLLAMA_HOST)
+            for chunk in client.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": LLM_TEMPERATURE, "num_ctx": LLM_NUM_CTX},
+                stream=True,
+            ):
+                piece = chunk.get("message", {}).get("content", "")
+                if piece:
+                    yield piece
+        except Exception as e:
+            self.error = str(e)
+            yield f"Ollama error: {e}. Is the server running? Try: ollama serve"

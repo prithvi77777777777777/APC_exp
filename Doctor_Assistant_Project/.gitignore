@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# Data (Keep the folder structure, ignore the heavy files)
+data/raw/*
+data/processed/*
+data/chroma_db/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/chroma_db/.gitkeep
+
+# OS generated files
+.DS_Store
+Thumbs.db
